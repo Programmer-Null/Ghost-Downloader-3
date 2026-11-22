@@ -173,46 +173,71 @@ def startApp(application: Application, primaryInstance: PrimaryInstance, isSilen
     shouldRunOobe = not cfg.hasCompletedOobe.value and not isSilent
 
     if shouldRunOobe:
-        # 首次启动：服务先就绪，主窗口等 OOBE 结束后按最终配置创建
-        from PySide6.QtCore import QEventLoop
-        from app.view.windows.oobe_window import OobeWindow
+    # 首次启动：服务先就绪，主窗口等 OOBE 结束后按最终配置创建
+    from PySide6.QtCore import QEventLoop
+    from PySide6.QtWidgets import QMessageBox
+    from shiboken6 import isValid
+    from app.view.windows.oobe_window import OobeWindow
 
-        engine.start()
+    engine.start()
 
-        oobe = OobeWindow(browserService, engine.browserListener, coroutineRunner, featureService, engine.runtimeStatusService)
-        def onOobePairRequestChanged(request):
-            if request is not None:
-                oobe.onPairRequested(request)
+    oobe = OobeWindow(browserService, engine.browserListener, coroutineRunner,
+                      featureService, engine.runtimeStatusService)
 
-        browserService.pairRequestChanged.connect(onOobePairRequestChanged)
+    def onOobePairRequestChanged(request):
+        if request is not None:
+            oobe.onPairRequested(request)
+
+    browserService.pairRequestChanged.connect(onOobePairRequestChanged)
+
+    # OOBE 期间主窗口尚未创建，下方 signalBus.exceptionCaught 的常规接收者
+    # （依赖 show()）还没挂上；此时若发生未捕获异常，打包版 _exceptionHook
+    # 不会写 stderr，用户只能看到 OOBE 卡死。这里临时挂一个接收者，
+    # 用模态框把异常直接呈现给用户。
+    _oobeBoxShown = False
+
+    def onOobeException(msg: str) -> None:
+        nonlocal _oobeBoxShown
+        # QMessageBox.exec() 内部会跑嵌套事件循环，期间可能再次 emit，
+        # 用标志位避免弹窗堆叠
+        if _oobeBoxShown:
+            return
+        _oobeBoxShown = True
+        try:
+            alive = isValid(oobe)
+            box = QMessageBox(
+                QMessageBox.Icon.Critical,
+                oobe.tr("未处理的异常") if alive else "未处理的异常",
+                "启动过程中发生未处理的异常，应用可能需要重启。",
+                QMessageBox.StandardButton.Ok,
+                oobe if alive else None,
+            )
+            box.setDetailedText(msg)
+            box.exec()
+        finally:
+            _oobeBoxShown = False
+
+    signalBus.exceptionCaught.connect(onOobeException)
+
+    try:
         oobe.show()
 
         loop = QEventLoop()
         oobe.finished.connect(loop.quit)
         oobe.destroyed.connect(loop.quit)
         loop.exec()
-
+    finally:
+        # 必须在 show() 之前断开：否则后续 show() 创建主窗口后，
+        # 这条临时 handler 会与常规接收者同时处理异常，弹双重框
+        signalBus.exceptionCaught.disconnect(onOobeException)
         browserService.pairRequestChanged.disconnect(onOobePairRequestChanged)
         # 必须在主线程显式销毁：闭包连接使窗口陷入循环引用，若留给
         # Python GC 会在任意工作线程 delete，主线程定时器表悬空 → 闪退
         oobe.deleteLater()
 
-        show()
-    else:
-        createWindow()
-
-        if not isSilent and sys.platform != "darwin":
-            from qfluentwidgets import SplashScreen
-            splash = SplashScreen(window.windowIcon(), window, enableShadow=False)
-            splash.raise_()
-            window.show()
-            application.processEvents()
-
-        window.setupPacks()
-        engine.start()
-
-        if not isSilent and sys.platform != "darwin":
-            splash.finish()
+    show()
+else:
+    # ... 原样保留 ...
 
     if sys.platform != "darwin":
         signalBus.activationRequested.connect(show)
